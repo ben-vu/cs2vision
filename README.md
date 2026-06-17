@@ -3,9 +3,7 @@
 This is the simulator-era pilot restructured to run on **real CS2 broadcast
 footage and real demo-derived ground truth**. The geometry, tracking, scoring
 and detection-evaluation maths are the same as the validated pilot; only the
-**inputs** are now real. Nothing here fabricates data — the modules that need
-your footage/demos/labels will error clearly if those are missing rather than
-inventing anything.
+**inputs** are now real.
 
 ## What runs right now (tested, no data needed)
 
