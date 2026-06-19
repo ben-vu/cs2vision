@@ -1,4 +1,4 @@
-# CS2Vision — real-footage pipeline
+# CS2Vision
 
 This is the simulator-era pilot restructured to run on **real CS2 broadcast
 footage and real demo-derived ground truth**. The geometry, tracking, scoring
