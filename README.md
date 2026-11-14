@@ -1,4 +1,4 @@
-# CS2Vision (single-map honours build)
+# CS2Vision
 
 CS2Vision reconstructs player positions from the observer radar in Counter-Strike 2 broadcast video. It scores what it recovers against demo ground truth, and reports that score against the ceiling the radar itself imposes.
 
