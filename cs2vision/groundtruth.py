@@ -1,170 +1,158 @@
-"""
-Ground-truth construction from real CS2 demo files (.dem) via demoparser2.
+"""Server-authoritative ground truth from a CS2 demo (thesis Section 2.2.2, RO1).
 
-For each demo this produces, per server tick:
-  * every player's world position (X,Y,Z), team, alive flag, health, armour
-  * those positions projected into canonical map-image pixels (RadarMeta)
-  * active smoke grenades as (map_pos, radius) exclusion zones
-  * round-start / bomb-plant event ticks (used by sync.py for video alignment)
+parse_demo() writes two files into the match folder:
+  gt_ticks.parquet  one row per (tick, player): team_num, alive, world x/y/z, canonical cx/cy
+  rounds.csv        one row per round: freeze_end_tick, end_tick, plant_tick, winner
 
-This is the *authoritative* reference the vision pipeline is scored against.
-It invents nothing: every coordinate comes from the Valve-authored demo.
-
-You supply: the .dem file (HLTV.org) and the matching Valve radar .txt
-(radarmeta.py). Demo tick rate in pro play is 64/s.
-
-Prop names differ slightly across demoparser2 versions and game updates.
-Run `python -m cs2vision.groundtruth --discover your.dem` to print the prop
-names actually present, then adjust WANTED_PROPS / TEAM_FIELD if needed.
+GTIndex gives fast "who is alive where at tick t" lookups for everything downstream.
 """
 from __future__ import annotations
 
-import argparse
-import json
-from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
-from .radarmeta import RadarMeta
+from .units import MapMeta
 
-# Smoke radius: CS2 smoke covers ~144 world units radius. Converted to map
-# pixels per-map at runtime (depends on that map's `scale`).
-SMOKE_WORLD_RADIUS = 144.0
-
-WANTED_PROPS = ["X", "Y", "Z", "health", "armor_value", "team_num", "is_alive"]
-TEAM_FIELD = "team_num"          # 2 = T, 3 = CT in CS2 demos
-TEAM_MAP = {2: "T", 3: "CT"}
+TEAM_T, TEAM_CT = 2, 3
 
 
-@dataclass
-class TickGroundTruth:
-    tick: int
-    players: list[dict]                 # team, alive, hp, armour, world, map_pos
-    smokes: list[dict] = field(default_factory=list)   # map_pos, radius (px)
-
-    def to_dict(self) -> dict:
-        return dict(tick=self.tick, players=self.players, smokes=self.smokes)
+def team_to_class(team_num: np.ndarray, mode: str) -> np.ndarray:
+    team_num = np.asarray(team_num)
+    if mode == "single":
+        return np.zeros(len(team_num), dtype=int)
+    return np.where(team_num == TEAM_CT, 0, 1).astype(int)
 
 
-class DemoGroundTruth:
-    def __init__(self, demo_path: str, radar: RadarMeta):
-        from demoparser2 import DemoParser     # imported lazily
-        self.parser = DemoParser(demo_path)
-        self.radar = radar
-        self.demo_path = demo_path
-
-    # ------------------------------------------------------------------ #
-    def discover_fields(self) -> list[str]:
-        """Print prop names present in this demo so you can fix WANTED_PROPS."""
-        try:
-            fields = self.parser.list_updated_fields()
-        except Exception:
-            fields = []
-        return list(fields)
-
-    def header(self) -> dict:
-        return self.parser.parse_header()
-
-    # ------------------------------------------------------------------ #
-    def event_ticks(self, event_name: str) -> list[int]:
-        """Tick of every occurrence of an event (e.g. 'round_start')."""
-        df = self.parser.parse_events(event_name)
-        if df is None or len(df) == 0 or "tick" not in df:
-            return []
-        return sorted(int(t) for t in df["tick"].tolist())
-
-    # ------------------------------------------------------------------ #
-    def smoke_zones_by_tick(self, ticks: list[int] | None = None) -> dict[int, list[dict]]:
-        """tick -> list of active smoke zones in map pixels.
-
-        parse_grenades returns one row per (grenade, tick) over the grenade's
-        lifetime, so the set of ticks a smoke appears at *is* its active span.
-        Real demos use lowercase x/y/z and emit NaN coords before detonation;
-        we keep only the deployed cloud (CSmokeGrenade, not the in-flight
-        Projectile) with valid coordinates. Pass `ticks` to project only the
-        frames you actually have (full-match iteration is hundreds of k rows).
-        """
-        gren = self.parser.parse_grenades()
-        zones: dict[int, list[dict]] = {}
-        if gren is None or len(gren) == 0:
-            return zones
-        cols = {c.lower(): c for c in gren.columns}
-        cx, cy, cz = cols.get("x", "x"), cols.get("y", "y"), cols.get("z", "z")
-        gtype = gren["grenade_type"].astype(str)
-        smokes = gren[(gtype == "CSmokeGrenade") | (gtype == "SmokeGrenade")]
-        smokes = smokes.dropna(subset=[cx, cy])
-        if ticks is not None:
-            smokes = smokes[smokes["tick"].isin(set(int(t) for t in ticks))]
-        for _, r in smokes.iterrows():
-            z = float(r[cz]) if cz in r and r[cz] == r[cz] else 0.0
-            world = np.array([[float(r[cx]), float(r[cy]), z]])
-            mp = self.radar.world_to_map(world)[0]
-            _, _, sc = self.radar._params_for_z(z)
-            rad_px = SMOKE_WORLD_RADIUS / sc
-            zones.setdefault(int(r["tick"]), []).append(
-                dict(map_pos=[float(mp[0]), float(mp[1])], radius=float(rad_px)))
-        return zones
-
-    # ------------------------------------------------------------------ #
-    def build(self, ticks: list[int] | None = None) -> list[TickGroundTruth]:
-        """Build per-tick ground truth. `ticks` restricts to the ticks you
-        actually have video frames for (recommended; full-match parsing of
-        every tick is large)."""
-        df = self.parser.parse_ticks(WANTED_PROPS, ticks=ticks)
-        smokes = self.smoke_zones_by_tick(ticks=ticks)
-        out: list[TickGroundTruth] = []
-        for tick, grp in df.groupby("tick"):
-            players = []
-            worlds = []
-            for _, row in grp.iterrows():
-                team = TEAM_MAP.get(int(row[TEAM_FIELD]), "?") \
-                    if TEAM_FIELD in row and row[TEAM_FIELD] == row[TEAM_FIELD] else "?"
-                alive = bool(row.get("is_alive", True))
-                w = [float(row["X"]), float(row["Y"]), float(row.get("Z", 0.0))]
-                worlds.append(w)
-                players.append(dict(
-                    steamid=str(row.get("steamid", "")),
-                    name=str(row.get("name", "")),
-                    team=team, alive=alive,
-                    hp=int(row.get("health", 0) or 0),
-                    armour=int(row.get("armor_value", 0) or 0),
-                    world=w))
-            if worlds:
-                mp = self.radar.world_to_map(np.array(worlds))
-                for p, m in zip(players, mp):
-                    p["map_pos"] = [float(m[0]), float(m[1])]
-            out.append(TickGroundTruth(int(tick), players, smokes.get(int(tick), [])))
-        out.sort(key=lambda g: g.tick)
-        return out
+def _event(parser, name: str) -> pd.DataFrame:
+    try:
+        df = parser.parse_event(name)
+        return df if df is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 
-def save_ground_truth(gts: list[TickGroundTruth], path: str):
-    with open(path, "w") as f:
-        json.dump([g.to_dict() for g in gts], f)
+def build_rounds(freeze_ticks, end_df: pd.DataFrame, plant_ticks, round_no_at) -> pd.DataFrame:
+    """Pair every round_end with the latest freeze_end that precedes it.
+
+    Restarts (e.g. after a technical issue) produce duplicate round numbers; the last
+    occurrence is kept, which is the round that actually counted.
+    """
+    freeze_ticks = np.sort(np.asarray(freeze_ticks, dtype=int))
+    plant_ticks = np.sort(np.asarray(plant_ticks, dtype=int))
+    rows, prev_end = [], -1
+    for _, r in end_df.sort_values("tick").iterrows():
+        end = int(r["tick"])
+        cands = freeze_ticks[(freeze_ticks > prev_end) & (freeze_ticks < end)]
+        prev_end = end
+        if len(cands) == 0:
+            continue
+        fz = int(cands[-1])
+        plants = plant_ticks[(plant_ticks >= fz) & (plant_ticks <= end)]
+        rows.append({
+            "round": int(round_no_at(fz)),
+            "freeze_end_tick": fz,
+            "end_tick": end,
+            "plant_tick": int(plants[0]) if len(plants) else -1,
+            "winner": r.get("winner", ""),
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.drop_duplicates("round", keep="last").sort_values("round").reset_index(drop=True)
+    return df
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("demo")
-    ap.add_argument("--radar", help="Valve overview .txt for this map")
-    ap.add_argument("--out", default="ground_truth.json")
-    ap.add_argument("--discover", action="store_true",
-                    help="just print available demo prop names and exit")
-    args = ap.parse_args()
+def parse_demo(demo_path: str | Path, out_dir: str | Path, meta: MapMeta) -> tuple[Path, Path]:
+    from demoparser2 import DemoParser  # imported lazily so tests run without it
 
-    if args.discover:
-        from demoparser2 import DemoParser
-        p = DemoParser(args.demo)
-        print("header:", p.parse_header())
-        try:
-            print("fields:", DemoParser(args.demo).list_updated_fields())
-        except Exception as e:
-            print("list_updated_fields unavailable:", e)
-        raise SystemExit
+    demo_path, out_dir = Path(demo_path), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    parser = DemoParser(str(demo_path))
 
-    radar = RadarMeta.from_txt(args.radar)
-    gt = DemoGroundTruth(args.demo, radar)
-    print("round_start ticks:", gt.event_ticks("round_start")[:10], "...")
-    records = gt.build()
-    save_ground_truth(records, args.out)
-    print(f"wrote {len(records)} tick records -> {args.out}")
+    header = parser.parse_header()
+    map_name = header.get("map_name", "")
+    if map_name and map_name != meta.name:
+        raise ValueError(f"{demo_path.name} is {map_name}, config expects {meta.name}")
+
+    freeze = _event(parser, "round_freeze_end")
+    ends = _event(parser, "round_end")
+    plants = _event(parser, "bomb_planted")
+    if freeze.empty or ends.empty:
+        raise RuntimeError("demo has no round_freeze_end / round_end events")
+
+    # Game-rules props at the event ticks: warmup flag and round counter.
+    key_ticks = sorted(set(freeze["tick"].astype(int)) | set(ends["tick"].astype(int)))
+    rules = parser.parse_ticks(["is_warmup_period", "total_rounds_played"], ticks=key_ticks)
+    rules = rules.groupby("tick").first()
+    warm = rules["is_warmup_period"].astype(bool)
+    ends = ends[~ends["tick"].map(warm).fillna(False).astype(bool)]
+    freeze = freeze[~freeze["tick"].map(warm).fillna(False).astype(bool)]
+
+    def round_no_at(t):
+        return int(rules.loc[t, "total_rounds_played"]) + 1 if t in rules.index else -1
+
+    rounds = build_rounds(freeze["tick"], ends, plants["tick"] if not plants.empty else [],
+                          round_no_at)
+    if rounds.empty:
+        raise RuntimeError("could not reconstruct any rounds from events")
+
+    live = np.concatenate([np.arange(a, b + 1) for a, b in
+                           zip(rounds["freeze_end_tick"], rounds["end_tick"])])
+    ticks = parser.parse_ticks(["X", "Y", "Z", "team_num", "is_alive"], ticks=live.tolist())
+    ticks = ticks[ticks["team_num"].isin([TEAM_T, TEAM_CT])].dropna(subset=["X", "Y"])
+    cx, cy = meta.world_to_canon(ticks["X"].to_numpy(), ticks["Y"].to_numpy())
+    gt = pd.DataFrame({
+        "tick": ticks["tick"].astype(np.int32).to_numpy(),
+        "steamid": ticks["steamid"].astype(str).to_numpy(),
+        "name": ticks["name"].astype(str).to_numpy(),
+        "team_num": ticks["team_num"].astype(np.int8).to_numpy(),
+        "alive": ticks["is_alive"].astype(bool).to_numpy(),
+        "x": ticks["X"].to_numpy(np.float32), "y": ticks["Y"].to_numpy(np.float32),
+        "z": ticks["Z"].to_numpy(np.float32),
+        "cx": cx.astype(np.float32), "cy": cy.astype(np.float32),
+    }).sort_values(["tick", "steamid"])
+
+    gt_path, rounds_path = out_dir / "gt_ticks.parquet", out_dir / "rounds.csv"
+    gt.to_parquet(gt_path, index=False)
+    rounds.to_csv(rounds_path, index=False)
+    return gt_path, rounds_path
+
+
+class GTIndex:
+    """Alive-player lookup by tick."""
+
+    def __init__(self, gt: pd.DataFrame, class_mode: str = "team"):
+        gt = gt[gt["alive"]].sort_values("tick")
+        self.tick = gt["tick"].to_numpy(np.int64)
+        self.cx = gt["cx"].to_numpy(float)
+        self.cy = gt["cy"].to_numpy(float)
+        self.team = gt["team_num"].to_numpy(int)
+        self.cls = team_to_class(self.team, class_mode)
+        self.steamid = gt["steamid"].to_numpy()
+        self.uticks = np.unique(self.tick)
+
+    @classmethod
+    def load(cls, match_dir: str | Path, class_mode: str = "team") -> "GTIndex":
+        return cls(pd.read_parquet(Path(match_dir) / "gt_ticks.parquet"), class_mode)
+
+    def nearest_tick(self, t: float, max_gap: int = 4) -> int | None:
+        if len(self.uticks) == 0:
+            return None
+        i = int(np.clip(np.searchsorted(self.uticks, t), 1, len(self.uticks) - 1))
+        best = self.uticks[i] if abs(self.uticks[i] - t) < abs(self.uticks[i - 1] - t) \
+            else self.uticks[i - 1]
+        return int(best) if abs(best - t) <= max_gap else None
+
+    def at(self, t: float, max_gap: int = 4):
+        """(canon_xy [N,2], cls [N], steamid [N]) of alive players at the nearest tick."""
+        tk = self.nearest_tick(t, max_gap)
+        if tk is None:
+            return np.zeros((0, 2)), np.zeros(0, int), np.zeros(0, object)
+        a, b = np.searchsorted(self.tick, tk, "left"), np.searchsorted(self.tick, tk, "right")
+        return (np.stack([self.cx[a:b], self.cy[a:b]], 1), self.cls[a:b], self.steamid[a:b])
+
+
+def load_rounds(match_dir: str | Path) -> pd.DataFrame:
+    return pd.read_csv(Path(match_dir) / "rounds.csv")

@@ -1,109 +1,67 @@
-# CS2Vision
+# CS2Vision (single-map honours build)
 
-This is the simulator-era pilot restructured to run on **real CS2 broadcast
-footage and real demo-derived ground truth**. The geometry, tracking, scoring
-and detection-evaluation maths are the same as the validated pilot; only the
-**inputs** are now real.
+CS2Vision reconstructs player positions from the observer radar in Counter-Strike 2 broadcast video. It scores what it recovers against demo ground truth, and reports that score against the ceiling the radar itself imposes.
 
-## What runs right now (tested, no data needed)
+This build is scoped to one map (de_mirage) and one broadcast overlay style.
 
-These have unit tests (`python -m tests.test_units`) and pass:
-
-- `radarmeta.py` — parse Valve overview `.txt`, project world → canonical map px
-- `homography.py` — `CalibratedRadar` (exact) and `RegisteredRadar` (ECC) radar → map transforms
-- `ingest.py` — extract sampled frames + manifest from an `.mp4`
-- `sync.py` — fit video-frame ↔ demo-tick alignment
-- `dataset.py`, `pipeline.py`, `evaluation.py`, `experiments.py` — wiring verified by `python -m tests.smoke_test`
-
-## What only you can supply (the actual research work)
-
-| Need | How | Why it isn't done here |
-|---|---|---|
-| Broadcast video `.mp4` | Download ESL/BLAST/IEM VODs (YouTube/HLTV) | no footage in a sandbox |
-| Demo `.dem` files | HLTV.org demo archive, matched to each VOD | "" |
-| Valve radar `.txt` + `_radar.png` per map | extract from game files / community mirrors | licensed game assets |
-| Annotations | CVAT, export **YOLO 1.1** format | human labelling |
-| Trained YOLOv8 weights `.pt` | `train_yolo.py` on a GPU | no GPU / no labels here |
-| Radar screen rectangle per overlay | read it off one frame, fill `RadarRect` | per-broadcast calibration |
-| Frame↔tick anchors per clip | eyeball 3 shared events (round start, plant) | needs human judgement |
-
-## Install
+**Start with [GUIDE.md](GUIDE.md).** It explains how to go from raw demos and VODs to the result tables.
 
 ```bash
-pip install opencv-python-headless numpy scipy matplotlib pyyaml demoparser2 ultralytics
-```
-`ultralytics` (+torch) is only needed for `detector.py`/`train_yolo.py`.
-`demoparser2` is the CS2 demo parser (replaces the thesis's Go library; pure-Python, same ground truth).
-
-## End-to-end procedure
-
-**1. Ground truth from the demo.** First discover the exact prop names in your
-demo build, then build per-tick GT projected to map pixels:
-
-```bash
-python -m cs2vision.groundtruth match.dem --discover          # prints prop names
-python -m cs2vision.groundtruth match.dem --radar de_mirage.txt --out gt.json
-```
-If `--discover` shows different names (e.g. `team_name` vs `team_num`), edit
-`WANTED_PROPS`/`TEAM_FIELD` at the top of `groundtruth.py`.
-
-**2. Extract frames from the VOD.**
-```bash
-python -m cs2vision.ingest match.mp4 frames/clip01 --fps 2
+pip install -r requirements.txt && pip install -e .
+cs2v selftest      # synthetic end-to-end dry run, no real data needed
+pytest -q          # unit tests plus a wiring test
 ```
 
-**3. Sync.** Open the frame where a round visibly starts, note its `src_frame`
-from `frames/clip01/manifest.json`, and the matching `round_start` tick
-(`groundtruth.event_ticks('round_start')`). Repeat for ≥3 events, then:
-```python
-from cs2vision.sync import fit_sync
-sync = fit_sync([(src_frame_1, tick_1), (src_frame_2, tick_2), (src_frame_3, tick_3)])
-print(sync.residual_seconds())   # report this in the thesis as alignment drift
-```
+## Pipeline
 
-**4. Annotate + train.** Annotate a stratified frame sample in CVAT (classes in
-`classes.py`), export YOLO 1.1. Derive anchors and train:
-```bash
-python -m cs2vision.train_yolo --labels labels/ --k 9     # inspect small-object clusters
-python -m cs2vision.train_yolo --data data.yaml --train   # GPU; two-phase schedule
-```
+1. **Stage 1: ground truth, ingestion and sync.** `parse-demo` extracts ground truth from the demo, and `align` and `ingest` sync the video to it and extract frames.
+2. **Stage 2: radar geometry.** `calibrate` marks the radar by hand, then `align` refines that calibration automatically.
+3. **Stage 3: channel ceiling (Experiment A).** `exp-a` works from demos alone; no detector or video is needed.
+4. **Stage 4: detection and recovery (Experiments B and C).** `autolabel`, `train`, `exp-b` and `exp-c`.
 
-**5. Calibrate the radar rectangle.** In any frame, read the radar widget's
-pixel box and fill it in:
-```python
-from cs2vision.homography import RadarRect, CalibratedRadar, RegisteredRadar
-rect  = RadarRect(x=28, y=24, w=190, h=190, map_image_size=1024)
-radar = CalibratedRadar(rect)                          # static full-map radar (recommended)
-# radar = RegisteredRadar(rect, "de_mirage_radar.png") # if the HUD radar pans/zooms
-```
+Finally, `report` writes `results/RESULTS.md`. The distribution contains **no** match
+media, trained weights, or experiment results: the source can compute outputs after
+those inputs are supplied, but it does not authenticate numbers quoted in the thesis.
 
-**6. Run the experiments on real data.**
-```python
-from cs2vision.detector import YoloDetector
-from cs2vision.experiments import experiment_1, run_pipeline_experiments
-from cs2vision.classes import CLASSES
+**Scope of supplied source:** Experiments A–C only. The earlier five-map
+Experiment D simulator, its outputs, and its analysis scripts are not in this
+repository and cannot be reproduced from this package.
 
-det = YoloDetector("best.pt", CLASSES, imgsz=1280)
-clips = [("frames/clip01", "gt.json", sync, "labels/clip01")]   # one tuple per clip
+**Metric definitions:** completeness uses a 5 m presence threshold; fidelities
+use their stated 1 m, 3 m and 10 m thresholds, with assignment searching through
+at least 10 m. Thus 10 m fidelity can be larger than 5 m completeness.
 
-experiment_1(det, clips)                                  # detection mAP
-run_pipeline_experiments(det, lambda: CalibratedRadar(rect), clips)  # geometry/smoke/full
-```
-Results land in `outputs/metrics/`. These are now **real** measurements you ran.
+**Inference boundary:** detector and tracking read video frames, but per-match
+alignment and calibration in the experiment-building workflow use demo-derived
+positions. This is *not* an independently demonstrated video-only deployment
+workflow for unpaired, unseen broadcasts.
 
-## Honest notes / open problems
+## Module inventory (for Appendix A)
 
-- **Units changed.** Pilot thresholds were abstract "map units". Here they are
-  **canonical-map pixels** (≈1024 across a map). Re-tune `FIDELITY_THR_PX`,
-  `ASSOC_THR_PX`, and the homography jump limits on your validation split, and
-  state the px↔metre conversion (from the map `scale`) in the thesis.
-- **Radar anchoring is the real research risk.** The pilot's cyan cross-markers
-  don't exist on real radars; that's why this uses calibration + image
-  registration instead. The `RegisteredRadar` ECC path is the part most likely
-  to need iteration on real HUDs (zoom-follow radars, overlay occlusion).
-- **Smoke radius on the radar** is estimated from the detected box; validate it
-  against the known 144-unit world radius once you have smoke annotations.
-- **Sync is semi-manual.** Automating anchor detection (round-start audio,
-  bomb-plant frames) is a reasonable thesis sub-contribution but isn't built.
-- The detector is anchor-free YOLOv8; the k-means output is reported to justify
-  the P2 head and document the small-object scale distribution.
+| Module | Role |
+|---|---|
+| `units.py` | World units, canonical radar pixels and metres (Appendix C); Mirage overview transform. |
+| `groundtruth.py` | demoparser2 extraction of per-tick player state and round boundaries; fast tick lookup. |
+| `video.py` | Timestamp-based frame access. |
+| `radar.py` | Canonical-to-frame transform, robust affine/homography fit (RANSAC, 3 px), radar-visibility check. |
+| `calibrate.py` | One-off hand calibration of the radar rectangle and blip diameter. |
+| `blobs.py` | Classical colour-threshold blip detector: used for sync, calibration refinement, label checking, and as the non-learned baseline. |
+| `sync.py` | Anchor-based prediction plus per-round automatic sync; alternating calibration refinement; residual and drift reporting. |
+| `viz.py` | Check sheets overlaying demo positions on the broadcast radar. |
+| `ingest.py` | Samples live-round frames, crops the radar, drops frames where the radar is hidden, writes the manifest. |
+| `autolabel.py` | Match-level splits, YOLO labels projected from the demo, automatic agreement, and the 200-image manual check sample. |
+| `train.py` | Two-phase YOLOv8 training for each configuration and seed; blip-scale study. |
+| `detector.py` | Common detector interface over YOLO and blob detectors. |
+| `tracker.py` | Per-team Hungarian tracker with confidence decay and last-known-position coasting. |
+| `channel.py` | Precision floor, blip separability, recoverable fraction. |
+| `evaluate.py` | Hungarian matching, completeness and fidelity, four-way failure attribution, CIs and paired tests with Cohen's d_z. |
+| `pipeline.py` | Per-frame detect, project, track and score loop. |
+| `experiments.py` | Experiments A, B and C plus the report. |
+| `synth.py` | Synthetic fixture for tests and `selftest` (not a data source). |
+| `cli.py` | The `cs2v` command. |
+
+## Reproducibility
+
+- **Seeds.** Every stochastic step takes a seed: the split, the label-check sample, RANSAC, and YOLO training (with deterministic mode on).
+- **Splits.** Split assignments are written to `data/splits.csv` and never regenerated unless you pass `--force`.
+- **Media.** Broadcast video and demo files are third-party material and are not redistributed. Record the HLTV match URLs, VOD URLs and section times instead.

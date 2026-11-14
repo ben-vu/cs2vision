@@ -1,7 +1,5 @@
-"""CS2Vision — broadcast-only state-reconstruction pipeline (channel-limit framing)."""
-from . import (classes, radarmeta, ingest, sync, autosync, groundtruth,
-               dataset, homography, calibrate, autolabel, channel, detector,
-               pipeline, evaluation, experiments)
-__all__ = ["classes", "radarmeta", "ingest", "sync", "autosync", "groundtruth",
-           "dataset", "homography", "calibrate", "autolabel", "channel",
-           "detector", "pipeline", "evaluation", "experiments"]
+"""CS2Vision: radar-channel game-state reconstruction from CS2 broadcast video.
+
+Single-map (de_mirage) honours build. See GUIDE.md for the end-to-end workflow.
+"""
+__version__ = "1.0.0"

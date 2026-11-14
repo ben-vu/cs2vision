@@ -1,0 +1,20 @@
+[project]
+name = "cs2vision"
+version = "1.0.0"
+description = "Radar-channel game-state reconstruction for CS2 broadcasts (single-map honours build)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "scipy", "pandas", "pyarrow", "opencv-python", "matplotlib", "pyyaml", "demoparser2"]
+
+[project.optional-dependencies]
+train = ["ultralytics>=8.1"]
+dev = ["pytest"]
+
+[project.scripts]
+cs2v = "cs2vision.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cs2vision"]

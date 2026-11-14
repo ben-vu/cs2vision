@@ -1,0 +1,78 @@
+# CS2Vision configuration: single map (de_mirage), single broadcast overlay style.
+# Every threshold that has a physical meaning is given in METRES and converted
+# to pixels at run time (see cs2vision/units.py).
+
+map:
+  name: de_mirage
+  # Valve overview metadata (game/csgo/resource/overviews/de_mirage.txt).
+  # Verify these three numbers against your game files before running anything.
+  pos_x: -3230
+  pos_y: 1713
+  scale: 5.0          # world units per canonical radar pixel
+  radar_size: 1024    # canonical radar image is radar_size x radar_size
+
+demo:
+  tickrate: 64
+
+# "team"   -> two classes (0 = CT, 1 = T), matched per team at evaluation.
+# "single" -> one class (0 = player). Use this if CT and T blips are not
+#             reliably distinguishable by colour on your production's radar.
+classes: team
+
+video:
+  sample_fps: 1.0            # frames per second sampled from live rounds
+  radar_visible_min_ncc: 0.45 # frames whose radar crop correlates less than this
+                              # with the calibration reference are dropped
+  crop_pad: 6                # pixels of padding around the radar rectangle
+
+sync:
+  search_s: 4.0              # +/- seconds searched around the predicted round start
+  step_ticks: 2              # search resolution (2 ticks = 1/32 s)
+  window_s: [3.0, 35.0]      # part of each round used for matching (s after freeze end)
+  frames_per_round: 12
+  max_residual_px: 4.0       # rounds whose best mean matching error exceeds this are flagged
+
+blob:                        # classical detector used for sync, calibration refinement
+  min_saturation: 90         # and as the non-learned baseline in Experiment C
+  min_value: 110
+  area_min_frac: 0.25        # of the nominal blip area
+  area_max_frac: 3.0
+
+tracker:
+  gate_m: 3.0                # max association distance between frames
+  decay: 0.85                # confidence multiplier for an unobserved track
+  min_conf: 0.30             # tracks below this are dropped
+  max_tracks_per_class: 5
+
+eval:
+  fidelity_m: [1.0, 3.0, 10.0]   # first value is the headline threshold
+  presence_gate_m: 5.0           # a player "has a position" if matched within this
+  merge_frac: 1.0                # two blips count as merged (unresolvable) when their
+                                 # centres are closer than merge_frac x blip diameter
+  phases:                        # seconds after freeze end; post_plant overrides
+    early: [0, 20]
+    mid: [20, 60]
+    late: [60, 1000]
+
+train:
+  model_size: m              # n / s / m ; use s if GPU time is short
+  seeds: [0, 1, 2]
+  epochs_phase1: 20          # backbone frozen
+  epochs_phase2: 40          # full network, lower learning rate
+  lr_phase1: 0.001
+  lr_phase2: 0.0001
+  batch: 16
+  workers: 4
+  device: null               # null = let ultralytics choose; "0" for first GPU; "cpu"
+  configs:
+    full:   {p2: true,  imgsz: 640}
+    no_p2:  {p2: false, imgsz: 640}
+    lowres: {p2: true,  imgsz: 320}
+  primary: full
+
+paths:
+  matches: data/matches
+  splits: data/splits.csv
+  dataset: work/dataset
+  runs: work/runs
+  results: results
